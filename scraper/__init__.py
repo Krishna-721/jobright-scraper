@@ -1,0 +1,1 @@
+"""Jobright scraping components."""
