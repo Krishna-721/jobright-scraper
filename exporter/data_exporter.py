@@ -11,6 +11,7 @@ CSV_FIELDS = [
     "company",
     "location",
     "link",
+    "jobright_url",
     "link_hash",
     "source",
     "description",

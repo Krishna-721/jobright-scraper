@@ -51,13 +51,17 @@ class ScraperConfig:
 
     keywords: list[str] = field(
         default_factory=lambda: [
-            "Software Engineer",
-            "Backend Engineer",
-            "Full Stack Engineer",
+            "Data Analyst",
+            "Data Engineer",
+            "Business Intelligence Analyst",
+            "SQL Data Analyst",
+            "Reporting Analyst",
+            "BI Developer",
         ]
     )
 
-    max_jobs_per_keyword: int = 500
+    # This is the overall unique-job target across all configured keywords.
+    max_jobs_per_keyword: int = 100
 
     # ------------------------------------------------------------------
     # Filters
@@ -78,7 +82,8 @@ class ScraperConfig:
 
     seniority: list[str] = field(
         default_factory=lambda: [
-            "Intern/New Grad",
+            "Mid Level",
+            "Senior Level",
         ]
     )
 
@@ -128,9 +133,12 @@ class ScraperConfig:
 
         if not keywords:
             keywords = [
-                "Software Engineer",
-                "Backend Engineer",
-                "Full Stack Engineer",
+                "Data Analyst",
+                "Data Engineer",
+                "Business Intelligence Analyst",
+                "SQL Data Analyst",
+                "Reporting Analyst",
+                "BI Developer",
             ]
 
         job_types = csv_list(os.getenv("JOBRIGHT_JOB_TYPES"))
@@ -145,7 +153,8 @@ class ScraperConfig:
 
         if not seniority:
             seniority = [
-                "Intern/New Grad",
+                "Mid Level",
+                "Senior Level",
             ]
 
         countries = csv_list(os.getenv("JOBRIGHT_COUNTRIES"))

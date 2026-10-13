@@ -12,7 +12,10 @@ class JobListing:
     company: str = ""
     location: str = ""
 
+    # Final company careers/job-posting URL (falls back to Jobright if unresolved).
     link: str = ""
+    # Original Jobright detail URL, retained for traceability.
+    jobright_url: str = ""
     link_hash: str = ""
 
     source: str = "jobright"

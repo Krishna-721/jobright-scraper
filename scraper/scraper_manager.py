@@ -1,6 +1,8 @@
 """Jobright scraping orchestration."""
 
 import logging
+import re
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import (
     Page,
@@ -20,7 +22,7 @@ from core.constants import (
 )
 from core.models import JobListing
 
-from scraper.parser import parse_job_card
+from scraper.parser import make_link_hash, parse_job_card
 from scraper.url_builder import URLBuilder
 
 
@@ -1153,52 +1155,169 @@ class ScraperManager:
 
         return list(all_country_jobs.values())
 
+    @staticmethod
+    def _is_company_url(url: str) -> bool:
+        """Return True for a usable HTTP(S) URL outside Jobright itself."""
+        if not url:
+            return False
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        hostname = (parsed.hostname or "").lower()
+        return hostname != "jobright.ai" and not hostname.endswith(".jobright.ai")
+
+    async def _capture_company_job_url(self, detail_page: Page) -> str:
+        """Click Apply on a Jobright detail page and return its final destination.
+
+        Supports links that navigate the current tab, links/buttons that open a
+        popup/new tab, and ordinary href redirects. A Jobright URL is never
+        accepted as the company destination.
+        """
+        apply_name = re.compile(
+            r"\b(apply now|apply|easy apply|apply for this job)\b", re.I
+        )
+        candidates = [
+            detail_page.get_by_role("link", name=apply_name).first,
+            detail_page.get_by_role("button", name=apply_name).first,
+        ]
+
+        for apply_control in candidates:
+            try:
+                if (
+                    await apply_control.count() == 0
+                    or not await apply_control.is_visible()
+                ):
+                    continue
+
+                href = await apply_control.get_attribute("href")
+                original_url = detail_page.url
+
+                # First try the real click, which covers JavaScript handlers and
+                # lets the browser follow redirects exactly as a user would.
+                try:
+                    async with detail_page.expect_popup(timeout=2500) as popup_info:
+                        await apply_control.click(timeout=5000)
+                    popup_page = await popup_info.value
+                    try:
+                        try:
+                            await popup_page.wait_for_load_state(
+                                "domcontentloaded", timeout=10000
+                            )
+                        except Exception:
+                            pass
+                        destination = popup_page.url
+                        if self._is_company_url(destination):
+                            LOGGER.info(
+                                "Captured company job URL from Apply popup: %s",
+                                destination,
+                            )
+                            return destination
+                    finally:
+                        await popup_page.close()
+                except PlaywrightTimeoutError:
+                    # No popup: the click may have navigated the current tab.
+                    try:
+                        await detail_page.wait_for_load_state(
+                            "domcontentloaded", timeout=5000
+                        )
+                    except Exception:
+                        pass
+
+                    destination = detail_page.url
+                    if destination != original_url and self._is_company_url(
+                        destination
+                    ):
+                        LOGGER.info(
+                            "Captured company job URL from same-tab Apply navigation: %s",
+                            destination,
+                        )
+                        return destination
+                except Exception as exc:
+                    LOGGER.debug("Apply click did not yield a popup: %s", exc)
+
+                # Fallback for anchors whose click is blocked or which expose a
+                # redirect URL in href. Navigating a temporary tab resolves the
+                # redirect chain without losing the Jobright detail page.
+                if href:
+                    target_url = urljoin(original_url, href.strip())
+                    if self._is_company_url(target_url):
+                        target_page = await detail_page.context.new_page()
+                        try:
+                            await target_page.goto(
+                                target_url,
+                                wait_until="domcontentloaded",
+                                timeout=self.config.timeout_ms,
+                            )
+                            try:
+                                await target_page.wait_for_load_state(
+                                    "networkidle", timeout=5000
+                                )
+                            except Exception:
+                                pass
+                            destination = target_page.url
+                            if self._is_company_url(destination):
+                                LOGGER.info(
+                                    "Resolved company job URL from Apply href: %s",
+                                    destination,
+                                )
+                                return destination
+                        except Exception as exc:
+                            LOGGER.debug(
+                                "Could not resolve Apply href %s: %s", target_url, exc
+                            )
+                        finally:
+                            await target_page.close()
+
+            except Exception as exc:
+                LOGGER.debug("Could not inspect an Apply control: %s", exc)
+                continue
+
+        return ""
+
     async def enrich_job(
         self,
         job: JobListing,
     ) -> JobListing:
-        """
-        Open a job detail page and enrich the listing.
-
-        The detail parser currently uses rendered page text rather
-        than relying on unverified internal Jobright class names.
-        """
-
+        """Enrich a listing and replace ``link`` with the company job URL."""
         from scraper.parser import parse_detail_text
 
+        # Preserve the original URL before `link` is replaced with the final
+        # company URL. This also makes older JobListing objects compatible.
+        if not job.jobright_url:
+            job.jobright_url = job.link
+        jobright_url = job.jobright_url
         detail_page = await self.page.context.new_page()
 
         try:
             await detail_page.goto(
-                job.link,
+                jobright_url,
                 wait_until="domcontentloaded",
                 timeout=self.config.timeout_ms,
             )
 
             await detail_page.wait_for_timeout(1500)
+            text = await detail_page.locator("body").inner_text()
+            job = parse_detail_text(text, job)
 
-            body = detail_page.locator("body")
-
-            text = await body.inner_text()
-
-            job = parse_detail_text(
-                text,
-                job,
-            )
+            company_url = await self._capture_company_job_url(detail_page)
+            if company_url:
+                job.link = company_url
+                job.link_hash = make_link_hash(company_url)
+            else:
+                # Keep the original Jobright URL if the Apply destination could
+                # not be identified; never fabricate a company URL.
+                job.link = jobright_url
+                job.link_hash = make_link_hash(jobright_url)
+                LOGGER.warning(
+                    "Could not resolve company job URL for %s; keeping Jobright URL: %s",
+                    job.title,
+                    jobright_url,
+                )
 
         except PlaywrightTimeoutError:
-            LOGGER.warning(
-                "Timeout loading detail page: %s",
-                job.link,
-            )
-
+            LOGGER.warning("Timeout loading detail page: %s", jobright_url)
         except Exception as exc:
-            LOGGER.warning(
-                "Detail extraction failed for %s: %s",
-                job.link,
-                exc,
-            )
-
+            LOGGER.warning("Detail extraction failed for %s: %s", jobright_url, exc)
         finally:
             await detail_page.close()
 
@@ -1259,9 +1378,17 @@ class ScraperManager:
         # --------------------------------------------------------------
 
         for keyword in self.config.keywords:
+            remaining = self.config.max_jobs_per_keyword - len(all_jobs)
+            if remaining <= 0:
+                LOGGER.info(
+                    "Reached overall job target of %d.",
+                    self.config.max_jobs_per_keyword,
+                )
+                break
+
             jobs = await self.scrape_keyword(keyword)
 
-            for job in jobs:
+            for job in jobs[:remaining]:
                 existing = all_jobs.get(job.link_hash)
 
                 # ------------------------------------------------------

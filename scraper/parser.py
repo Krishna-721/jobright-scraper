@@ -184,6 +184,7 @@ async def parse_job_card(
             company=company,
             location=location,
             link=link,
+            jobright_url=link,
             link_hash=link_hash,
             source="jobright",
             description="",
